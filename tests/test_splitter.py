@@ -7,7 +7,7 @@ as well as under pytest.
 import random
 import unittest
 from fractions import Fraction
-from itertools import permutations
+from itertools import permutations, product
 from math import factorial
 from types import SimpleNamespace as P
 
@@ -15,6 +15,7 @@ from app.splitter import (
     _triple,
     admit_passengers,
     fare_envelope,
+    reconcile_receipts,
     revision_impact,
     settle_balances,
     split_fares,
@@ -28,6 +29,10 @@ def ride(pid, board, alight):
 
 def cand(pid, board, alight, max_fare):
     return P(id=pid, board=board, alight=alight, max_fare=max_fare)
+
+
+def receipt(rid, amount, segments):
+    return P(id=rid, amount=amount, segments=segments)
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -525,6 +530,119 @@ def _brute_force_envelope(segments, bounds, passengers, total_cost, target_id):
         if best_max is None or value > best_max[0]:
             best_max = (value, costs)
     return best_min[0], best_min[1], best_max[0], best_max[1]
+
+
+class ReconcileReceiptsTests(unittest.TestCase):
+    def test_single_receipt_single_segment(self):
+        got = reconcile_receipts([100], [receipt("r1", 100, [0])])
+        self.assertEqual(got, [("r1", 0)])
+
+    def test_each_segment_exactly_covered(self):
+        receipts = [receipt("a", 60, [0, 1]), receipt("b", 40, [1]),
+                    receipt("c", 30, [0])]
+        got = reconcile_receipts([90, 40], receipts)
+        self.assertEqual(got, [("a", 0), ("b", 1), ("c", 0)])
+
+    def test_result_is_ordered_by_receipt_id_not_input_order(self):
+        receipts = [receipt("b", 10, [0, 1]), receipt("a", 10, [0, 1])]
+        got = reconcile_receipts([10, 10], receipts)
+        # both assignments feasible; the id-sorted sequence (a, b) takes the
+        # lexicographically smallest segment sequence (0, 1)
+        self.assertEqual(got, [("a", 0), ("b", 1)])
+
+    def test_lex_smallest_feasible_sequence_requires_backtracking(self):
+        # Greedy a->0 strands b (7 fits nowhere), so the search must
+        # backtrack to a->1, b->0 — the lex-smallest *feasible* sequence.
+        receipts = [receipt("a", 5, [0, 1]), receipt("b", 7, [0, 1])]
+        got = reconcile_receipts([7, 5], receipts)
+        self.assertEqual(got, [("a", 1), ("b", 0)])
+
+    def test_receipts_are_never_split_across_segments(self):
+        # Fractionally 2+2 covers 3+1, but whole receipts cannot be split.
+        receipts = [receipt("a", 2, [0, 1]), receipt("b", 2, [0, 1])]
+        with self.assertRaises(ValueError):
+            reconcile_receipts([3, 1], receipts)
+
+    def test_unsatisfiable_raises(self):
+        # totals match (6 == 6) but receipt "a" exceeds every segment it
+        # may be attributed to
+        with self.assertRaises(ValueError):
+            reconcile_receipts([3, 3], [receipt("a", 4, [0]),
+                                        receipt("b", 2, [1])])
+
+    def test_zero_cost_segments_take_no_receipts(self):
+        got = reconcile_receipts([0, 50], [receipt("a", 50, [0, 1])])
+        self.assertEqual(got, [("a", 1)])
+
+    def test_empty_receipt_list_on_free_trip(self):
+        self.assertEqual(reconcile_receipts([0, 0], []), [])
+
+    def test_input_order_does_not_matter(self):
+        receipts = [receipt("r3", 30, [1]), receipt("r1", 20, [0, 1]),
+                    receipt("r2", 50, [0])]
+        baseline = reconcile_receipts([50, 50], receipts)
+        self.assertEqual(baseline, [("r1", 1), ("r2", 0), ("r3", 1)])
+        for perm in permutations(receipts):
+            self.assertEqual(reconcile_receipts([50, 50], list(perm)), baseline)
+
+    def test_unsatisfiable_12_receipts_terminates_via_memoization(self):
+        # 12 receipts of 5 cents vs 10 segments of 6 cents: every segment
+        # fits at most one receipt, so two receipts can never be placed.
+        # Without dead-end memoization this explores ~10! placements.
+        receipts = [receipt(f"r{i}", 5, list(range(10))) for i in range(12)]
+        with self.assertRaises(ValueError):
+            reconcile_receipts([6] * 10, receipts)
+
+    def test_matches_brute_force_lex_minimum(self):
+        rng = random.Random(20260927)
+        for _ in range(300):
+            n_seg = rng.randint(1, 4)
+            segments = [rng.randint(0, 20) for _ in range(n_seg)]
+            total = sum(segments)
+            if total == 0:
+                continue
+            n_rec = rng.randint(1, min(5, total))
+            amounts = [1] * n_rec
+            for _ in range(total - n_rec):
+                amounts[rng.randrange(n_rec)] += 1
+            receipts = [
+                receipt(
+                    f"r{i}",
+                    amounts[i],
+                    sorted(rng.sample(range(n_seg), rng.randint(1, n_seg))),
+                )
+                for i in range(n_rec)
+            ]
+            expected = _brute_force_reconcile(segments, receipts)
+            if expected is None:
+                with self.assertRaises(ValueError):
+                    reconcile_receipts(segments, receipts)
+            else:
+                self.assertEqual(
+                    reconcile_receipts(segments, receipts),
+                    expected,
+                    (segments, receipts),
+                )
+
+
+def _brute_force_reconcile(segment_costs, receipts):
+    """Exact canonical reconciliation by enumerating every assignment.
+
+    Test reference only: tries the full cartesian product of each receipt's
+    attributable segments and keeps the feasible assignment whose id-sorted
+    segment sequence is lexicographically smallest.
+    """
+    ordered = sorted(receipts, key=lambda r: r.id)
+    best = None
+    for combo in product(*(sorted(set(r.segments)) for r in ordered)):
+        sums = [0] * len(segment_costs)
+        for r, seg in zip(ordered, combo):
+            sums[seg] += r.amount
+        if sums == list(segment_costs) and (best is None or combo < best):
+            best = combo
+    if best is None:
+        return None
+    return [(r.id, seg) for r, seg in zip(ordered, best)]
 
 
 class SettleBalancesTests(unittest.TestCase):

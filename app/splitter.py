@@ -488,6 +488,76 @@ def fare_envelope(segments, bounds, passengers, total_cost, target_id):
     return min_amount, witness(min_x), max_amount, witness(max_x)
 
 
+# --- receipt reconciliation: attribute each receipt wholly to one segment
+
+
+def reconcile_receipts(segment_costs: List[int], receipts) -> List[Tuple]:
+    """Attribute every receipt wholly to one of its attributable segments.
+
+    ``receipts`` items must expose ``id`` (a string), ``amount`` (positive
+    integer cents) and ``segments`` (a non-empty list of valid segment
+    indices). A *reconciliation* assigns each receipt to exactly one of its
+    attributable segments — an amount is never split across segments — so
+    that the amounts assigned to every segment sum exactly to that
+    segment's cost. (The request layer already guarantees
+    ``sum(amounts) == sum(segment_costs)``; zero-cost segments therefore
+    simply receive no receipts.)
+
+    When several reconciliations exist, the receipts are ordered by id
+    (plain lexicographic string order) and the reconciliation whose
+    sequence of assigned segment indices — taken in that id order — is
+    lexicographically smallest wins. The search is a depth-first
+    backtracking over the receipts in exactly that id order, trying each
+    receipt's candidate segments in ascending index order, so the first
+    complete assignment it finds is the canonical one and the result does
+    not depend on the receipts' input order. Dead-end states are memoized:
+    with the receipts processed in a fixed order, the remaining subproblem
+    at depth ``j`` is fully determined by the remaining capacities of the
+    attributable segments, which keeps even unsatisfiable 12-receipt
+    instances cheap.
+
+    Returns a list of ``(receipt_id, segment_index)`` tuples in receipt-id
+    order. Raises ``ValueError`` when no reconciliation exists.
+    """
+    ordered = sorted(receipts, key=lambda r: r.id)
+    amounts = [r.amount for r in ordered]
+    choices = [sorted(set(r.segments)) for r in ordered]
+    n = len(ordered)
+    remaining = list(segment_costs)
+    assignment = [-1] * n
+    # Only attributable segments can ever change capacity; watching just
+    # those keeps the memoization keys small on long trips.
+    watched = sorted({seg for segs in choices for seg in segs})
+    dead = set()
+
+    def place(j: int) -> bool:
+        if j == n:
+            return True
+        key = (j, tuple(remaining[seg] for seg in watched))
+        if key in dead:
+            return False
+        amount = amounts[j]
+        for seg in choices[j]:
+            if remaining[seg] >= amount:
+                remaining[seg] -= amount
+                assignment[j] = seg
+                if place(j + 1):
+                    return True
+                remaining[seg] += amount
+        assignment[j] = -1
+        dead.add(key)
+        return False
+
+    if not place(0):
+        raise ValueError(
+            "receipts cannot be reconciled with the segment costs: no "
+            "assignment attributes every receipt wholly to one of its "
+            "attributable segments while matching every segment's cost "
+            "exactly"
+        )
+    return [(ordered[j].id, assignment[j]) for j in range(n)]
+
+
 # --- settlement: turn balances (paid - owed) into a minimal set of transfers
 
 

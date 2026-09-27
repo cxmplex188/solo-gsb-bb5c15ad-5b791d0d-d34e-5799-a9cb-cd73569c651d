@@ -439,3 +439,95 @@ class FareEnvelopeResponse(BaseModel):
     maximum: FareEnvelopeWitness = Field(
         description="largest payable amount and its witnessing cost vector"
     )
+
+
+class Receipt(BaseModel):
+    """One receipt to be attributed wholly to a single segment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="unique receipt id (a string)")
+    amount: PositiveInt = Field(
+        description="receipt amount in integer cents; must be > 0"
+    )
+    segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        description="non-empty list of segment indices (0-based) the receipt "
+                    "may be attributed to; the whole amount is assigned to "
+                    "exactly one of them",
+    )
+
+
+class ReceiptReconcileRequest(SplitRequest):
+    """A split request plus up to 12 receipts to reconcile with the costs."""
+
+    receipts: List[Receipt] = Field(
+        max_length=12,
+        description="up to 12 receipts (id/amount/segments); their amounts "
+                    "must sum exactly to the trip cost",
+    )
+
+    @model_validator(mode="after")
+    def _check_receipts(self) -> "ReceiptReconcileRequest":
+        n = len(self.segments)
+        seen = set()
+        for receipt in self.receipts:
+            if receipt.id in seen:
+                raise ValueError(f"duplicate receipt id: {receipt.id!r}")
+            seen.add(receipt.id)
+            if len(set(receipt.segments)) != len(receipt.segments):
+                raise ValueError(
+                    f"receipt {receipt.id!r}: duplicate segment index in "
+                    f"its attributable list {receipt.segments}"
+                )
+            for index in receipt.segments:
+                if index >= n:
+                    raise ValueError(
+                        f"receipt {receipt.id!r}: segment index {index} is "
+                        f"out of range; a trip with {n} segment(s) has "
+                        f"indices 0..{n - 1}"
+                    )
+        total = sum(receipt.amount for receipt in self.receipts)
+        total_cost = sum(self.segments)
+        if total != total_cost:
+            raise ValueError(
+                f"receipts total {total} cents but the trip costs "
+                f"{total_cost} cents (receipt amounts must cover the trip "
+                f"exactly)"
+            )
+        return self
+
+
+class ReceiptAssignment(BaseModel):
+    """One receipt's whole-amount attribution to a single segment."""
+
+    id: str = Field(description="receipt id")
+    amount: PositiveInt = Field(description="receipt amount in cents")
+    segment: int = Field(
+        description="index of the segment the receipt is attributed to, 0-based"
+    )
+
+
+class SegmentReceipts(BaseModel):
+    """The receipts attributed to one segment; their amounts sum to its cost."""
+
+    index: int = Field(description="segment index, 0-based, in travel order")
+    cost: NonNegativeInt = Field(description="segment cost in cents")
+    receipts: List[str] = Field(
+        description="ids of the receipts attributed to this segment, in "
+                    "lexicographic id order; their amounts sum exactly to cost"
+    )
+
+
+class ReceiptReconcileResponse(BaseModel):
+    total_cost: NonNegativeInt = Field(description="sum of all segment costs in cents")
+    assignments: List[ReceiptAssignment] = Field(
+        description="one entry per receipt, in lexicographic receipt-id order"
+    )
+    segments: List[SegmentReceipts] = Field(
+        description="per-segment list of attributed receipts, in segment order"
+    )
+    totals: Dict[str, NonNegativeInt] = Field(
+        description="cents charged to each passenger over the whole trip "
+                    "(same as /split totals); sums to total_cost"
+    )
