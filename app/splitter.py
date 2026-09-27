@@ -683,3 +683,124 @@ def _optimal_transfers(nonzero: List[Tuple]) -> List[Tuple]:
         (frm, to, amount)
         for frm, to, amount in sorted(partition(full), key=_triple)
     ]
+
+
+# --- receipt reconciliation: attribute every receipt, whole, to one segment
+
+
+def _merged_less(sub1, base1, sub2, base2, segment: int, n: int) -> bool:
+    """Compare two candidate index tuples for the same used-receipt mask.
+
+    At segment ``segment`` the two candidates attribute the subsets ``sub1``
+    /``sub2`` (bitmasks over the ``n`` id-sorted receipts) to it; receipts
+    outside the subset keep their earlier assignment from ``base1``/``base2``.
+    Receipts in the subset receive index ``segment`` — strictly larger than
+    every already-assigned index — while the others keep an earlier index, so
+    comparing element by element yields the lexicographically smaller
+    attribution without materializing both tuples.
+    """
+    for k in range(n):
+        v1 = segment if (sub1 >> k) & 1 else base1[k]
+        v2 = segment if (sub2 >> k) & 1 else base2[k]
+        if v1 != v2:
+            return v1 < v2
+    return False
+
+
+def reconcile_receipts(segment_costs: List[int], receipts):
+    """Attribute each receipt, for its full amount, to exactly one segment.
+
+    ``receipts`` items expose ``id`` (string), ``amount`` (positive integer
+    cents) and ``segments`` (indices the receipt may be attributed to). A
+    segment is covered exactly when the receipts attributed to it sum to the
+    segment's cost; every receipt must be used once and every segment must be
+    covered.
+
+    Returns ``(ordered_ids, assignment, segment_receipts)``: ``ordered_ids``
+    is the receipt ids sorted lexicographically; ``assignment[k]`` is the
+    segment attributed to ``ordered_ids[k]``; ``segment_receipts[j]`` lists
+    the ids covering segment ``j``, lexicographically sorted.
+
+    Tie-break: among all exact attributions, the sequence of attributed
+    segment indices in lexicographic id order is minimized.
+
+    Raises ``ValueError`` when no attribution covers every segment exactly.
+
+    The search is a left-to-right subset DP over the at most 12 receipts:
+    after processing segment ``j`` a state is the set of receipts already
+    consumed, labeled with the lexicographically smallest index sequence
+    reaching it. For each segment, every subset of still-available, allowed
+    receipts whose amounts sum to the segment cost is a possible transition.
+    """
+    n_segments = len(segment_costs)
+    ordered = sorted(receipts, key=lambda r: r.id)
+    m = len(ordered)
+    amounts = [r.amount for r in ordered]
+
+    # Per segment, bitmask of id-sorted receipt positions allowed on it;
+    # repeats in a receipt's segment list collapse to a single allowed bit.
+    allowed = [0] * n_segments
+    for k, r in enumerate(ordered):
+        for j in set(r.segments):
+            allowed[j] |= 1 << k
+
+    size = 1 << m
+    subset_sum = [0] * size
+    for mask in range(1, size):
+        bit = mask & -mask
+        subset_sum[mask] = (
+            subset_sum[mask ^ bit] + amounts[bit.bit_length() - 1]
+        )
+
+    full = size - 1
+    # states[mask] maps a consumed-receipt mask to the lexicographically
+    # smallest length-m tuple of attributed segment indices covering it with
+    # the processed segments; None marks receipts not consumed yet.
+    states: Dict[int, tuple] = {0: (None,) * m}
+
+    for j, cost in enumerate(segment_costs):
+        # One winning subset per resulting mask: the candidate yielding the
+        # smallest merged index tuple.
+        best_sub: Dict[int, int] = {}
+        for used, base in states.items():
+            avail = allowed[j] & (full ^ used)
+            sub = avail
+            while True:
+                if subset_sum[sub] == cost:
+                    new_mask = used | sub
+                    current = best_sub.get(new_mask)
+                    if current is None or _merged_less(
+                        sub, base, current, states[new_mask ^ current], j, m
+                    ):
+                        best_sub[new_mask] = sub
+                if sub == 0:
+                    break
+                sub = (sub - 1) & avail
+
+        if not best_sub:
+            raise ValueError(
+                f"receipts cannot be reconciled: no subset of still-available "
+                f"receipts totals segment {j}'s cost of {cost} cents"
+            )
+
+        states = {
+            new_mask: tuple(
+                j if (sub >> k) & 1 else states[new_mask ^ sub][k]
+                for k in range(m)
+            )
+            for new_mask, sub in best_sub.items()
+        }
+
+    best = states.get(full)
+    if best is None:
+        raise ValueError(
+            "receipts cannot be reconciled: the receipts total the trip cost "
+            "but no per-segment attribution covers every segment exactly"
+        )
+
+    assignment = list(best)
+    segment_receipts = [
+        [ordered[k].id for k in range(m) if assignment[k] == j]
+        for j in range(n_segments)
+    ]
+    return [r.id for r in ordered], assignment, segment_receipts

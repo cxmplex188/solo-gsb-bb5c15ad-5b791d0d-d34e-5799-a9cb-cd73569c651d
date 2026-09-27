@@ -5,9 +5,11 @@
 上车（座位与预算双约束，先求入选人数最多、再求入选者应付总额最小）；在提供每人
 实际付款记录后，自动生成**转账笔数全局最少**的结清方案；在路段费用修订后，
 按所有修订应用顺序计算每个变动路段对每人应付额的**平均边际影响（Shapley 归因）**；
-以及当行程中**恰有两段费用未定**时，在各自上下界与全程总价约束下求出目标乘客应付额的
-**精确最小/最大值**及完整费用见证（利用余数周期压缩搜索，绝不逐分遍历）。
-金额全程使用整数分与精确分数计算，总额严格守恒，且乘客与付款记录的输入顺序不影响结果。
+当行程中**恰有两段费用未定**时，在各自上下界与全程总价约束下求出目标乘客应付额的
+**精确最小/最大值**及完整费用见证（利用余数周期压缩搜索，绝不逐分遍历）；
+以及用**最多 12 张凭证核销**逐段费用（每张凭证整额归属唯一一个可归属路段，
+多方案时取字典序最小的归属序列），并同时给出逐人应付额。
+金额全程使用整数分与精确分数计算，总额严格守恒，且乘客、凭证与付款记录的输入顺序不影响结果。
 
 ## 快速启动
 
@@ -26,10 +28,11 @@ docker compose up --build
 | http://localhost:8000/settle | 分摊 + 结清转账接口（POST） |
 | http://localhost:8000/revision-impact | 路段费用修订的边际影响归因接口（POST） |
 | http://localhost:8000/fare-envelope | 两段费用未定时的应付额包络接口（POST） |
+| http://localhost:8000/receipt-reconcile | 凭证整额核销 + 分摊接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
 
-以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
+以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -379,6 +382,89 @@ curl -s http://localhost:8000/fare-envelope \
   -d '{"segments":[null,251,null],"bounds":[{"min":0,"max":300},{"min":0,"max":300}],"total_cost":551,"target":"alice","passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3}]}'
 ```
 
+## API：`POST /receipt-reconcile`
+
+在 `/split` 的同一套 `segments`、`passengers` 基础上增加 `receipts`：**最多 12 张凭证**，
+每张含唯一非空字符串 `id`、**正整数分** `amount` 与**非空**的可归属路段下标列表 `segments`。
+每张凭证必须**整额**归属其可归属路段中的**唯一一个**（不可拆分到多段）；
+每段获分配凭证的金额之和必须**恰好等于**该段费用，全部凭证恰好各用一次。
+
+满足条件的核销方案可能不止一个。方案间的取舍规则为：先把凭证按 `id` **字典序**排列，
+再选择其「归属路段下标序列」**字典序最小**的方案。因此凭证在请求中的排列顺序不影响响应。
+
+### 请求体
+
+```json
+{
+  "segments": [100, 251, 80],
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 3},
+    {"id": "bob",   "board": 1, "alight": 3},
+    {"id": "carol", "board": 0, "alight": 1}
+  ],
+  "receipts": [
+    {"id": "R-251",  "amount": 251, "segments": [1]},
+    {"id": "R-100b", "amount": 40,  "segments": [0, 2]},
+    {"id": "R-80a",  "amount": 40,  "segments": [0, 2]},
+    {"id": "R-80b",  "amount": 40,  "segments": [0, 2]},
+    {"id": "R-100a", "amount": 60,  "segments": [0, 2]}
+  ]
+}
+```
+
+- `receipts`：凭证数组，**至多 12 张**（行程总额为 0 时允许空数组）。
+- `receipts[].id`：非空字符串，彼此唯一（不得重复）。
+- `receipts[].amount`：凭证金额，**正整数分**（`> 0`，不允许 0、负数或小数）。
+- `receipts[].segments`：非空下标数组，元素为 0-based 路段下标，均须在 `[0, 路段数)` 内；
+  重复下标无害（按一个候选路段处理）。凭证最终只归属其中一个下标。
+- 全部凭证金额之和必须**恰好等于**行程总额（`sum(segments)`）。
+- 费用为 0 的路段不分配任何凭证（凭证金额均为正）；例如 `[0, 10]` 的行程中，
+  凭证只能归属第 1 段。
+
+### 响应（200）
+
+```json
+{
+  "total_cost": 431,
+  "assignments": [
+    {"id": "R-100a", "segment": 0},
+    {"id": "R-100b", "segment": 0},
+    {"id": "R-251",  "segment": 1},
+    {"id": "R-80a",  "segment": 2},
+    {"id": "R-80b",  "segment": 2}
+  ],
+  "segments": [
+    {"index": 0, "cost": 100, "receipts": ["R-100a", "R-100b"]},
+    {"index": 1, "cost": 251, "receipts": ["R-251"]},
+    {"index": 2, "cost": 80,  "receipts": ["R-80a", "R-80b"]}
+  ],
+  "totals": {"alice": 216, "bob": 165, "carol": 50}
+}
+```
+
+- `assignments`：逐凭证归属，按凭证 `id` 字典序排列；`segment` 即该凭证整额归属的路段下标。
+- `segments[]`：逐段列出归属到该段的凭证 `id`（字典序），其金额之和恒等于该段 `cost`。
+- `totals`：调用与 `/split` **完全相同**的分摊规则得到的逐人应付额，总和恒等于 `total_cost`。
+- 上例中四张 40/60 分凭证在第 0、2 段间有两种整额组合都能凑出 100/80；
+  按 id 字典序排列后的下标序列 `[0,0,1,2,2]` 小于另一方案的 `[0,2,1,0,2]`，故取前者。
+
+### 算法：从左到右的子集动态规划
+
+凭证至多 12 张，用位掩码表示「已消费凭证集合」。按路段顺序处理：处理完第 `j` 段后，
+每个状态记录已用凭证掩码，以及到达该掩码的**字典序最小归属序列**。对每一段，枚举
+当前仍可用、且被该段允许的凭证子集中**金额和恰好等于该段费用**者作为转移。
+每段至多枚举 `2^12 = 4096` 个子掩码，天然覆盖「多张凭证凑一段」「一张凭证单独覆盖一段」
+与零费用段（只能选择空子集）；终点掩码非全 1（或中途无可行转移）即不存在任何核销方案，
+返回 422。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/receipt-reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}],"receipts":[{"id":"R-251","amount":251,"segments":[1]},{"id":"R-100b","amount":40,"segments":[0,2]},{"id":"R-80a","amount":40,"segments":[0,2]},{"id":"R-80b","amount":40,"segments":[0,2]},{"id":"R-100a","amount":60,"segments":[0,2]}]}'
+```
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -404,7 +490,13 @@ curl -s http://localhost:8000/fare-envelope \
 - （仅 `/revision-impact`）费用发生变化的路段超过 8 个（归因需枚举全部 2^n 个子集）；
 - （仅 `/fare-envelope`）`segments` 中的 `null` 不是恰好两个、`bounds` 不是恰好两项或 `min > max`；
 - （仅 `/fare-envelope`）未定路段无乘客在车，或 `target` 不在乘客名单中；
-- （仅 `/fare-envelope`）上下界与全程总价矛盾，不存在可行费用组合。
+- （仅 `/fare-envelope`）上下界与全程总价矛盾，不存在可行费用组合；
+- （仅 `/receipt-reconcile`）凭证超过 12 张、凭证 `id` 为空或重复；
+- （仅 `/receipt-reconcile`）凭证 `amount` 非正整数（0、负数或小数），或 `segments` 列表为空；
+- （仅 `/receipt-reconcile`）凭证的可归属路段下标越界（`>= 路段数` 或为负）；
+- （仅 `/receipt-reconcile`）凭证金额之和不等于行程总额；
+- （仅 `/receipt-reconcile`）总额虽相符，但不存在「每张凭证整额归属一个允许路段、
+  每段所获金额恰好等于其费用」的核销方案。
 
 ## 本地开发与测试
 
@@ -420,9 +512,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）
+  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

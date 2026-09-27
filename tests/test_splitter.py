@@ -15,6 +15,7 @@ from app.splitter import (
     _triple,
     admit_passengers,
     fare_envelope,
+    reconcile_receipts,
     revision_impact,
     settle_balances,
     split_fares,
@@ -28,6 +29,10 @@ def ride(pid, board, alight):
 
 def cand(pid, board, alight, max_fare):
     return P(id=pid, board=board, alight=alight, max_fare=max_fare)
+
+
+def receipt(rid, amount, segments):
+    return P(id=rid, amount=amount, segments=segments)
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -702,6 +707,168 @@ class SettleOptimalityPropertyTests(unittest.TestCase):
                 net[to] += amount
             self.assertEqual(net, balances)
             self.assertEqual(transfers, sorted(transfers, key=_triple))
+
+
+class ReconcileReceiptsTests(unittest.TestCase):
+    def test_single_receipt_per_segment(self):
+        ids, assignment, segment_receipts = reconcile_receipts(
+            [100, 251, 80],
+            [receipt("a", 100, [0]), receipt("b", 251, [1]), receipt("c", 80, [2])],
+        )
+        self.assertEqual(ids, ["a", "b", "c"])
+        self.assertEqual(assignment, [0, 1, 2])
+        self.assertEqual(segment_receipts, [["a"], ["b"], ["c"]])
+
+    def test_receipts_can_combine_to_cover_a_segment(self):
+        ids, assignment, segment_receipts = reconcile_receipts(
+            [100, 251, 80],
+            [receipt("R-251", 251, [1]), receipt("R-100a", 60, [0, 2]),
+             receipt("R-100b", 40, [0, 2]), receipt("R-80a", 40, [0, 2]),
+             receipt("R-80b", 40, [0, 2])],
+        )
+        self.assertEqual(ids, ["R-100a", "R-100b", "R-251", "R-80a", "R-80b"])
+        self.assertEqual(assignment, [0, 0, 1, 2, 2])
+        self.assertEqual(segment_receipts,
+                         [["R-100a", "R-100b"], ["R-251"], ["R-80a", "R-80b"]])
+
+    def test_tie_break_picks_lex_smallest_index_sequence(self):
+        # Two exact attributions exist:
+        #   a->0,b->0,c->1,d->1 gives sequence (0,0,1,1)
+        #   a->0,b->1,c->1,d->0 gives sequence (0,1,1,0)
+        # The first is lexicographically smaller.
+        receipts = [receipt("a", 20, [0, 1]), receipt("b", 30, [0, 1]),
+                    receipt("c", 20, [1]), receipt("d", 30, [0, 1])]
+        _, assignment, segment_receipts = reconcile_receipts([50, 50], receipts)
+        self.assertEqual(assignment, [0, 0, 1, 1])
+        self.assertEqual(segment_receipts, [["a", "b"], ["c", "d"]])
+
+    def test_tie_break_decided_by_lexicographic_id_order(self):
+        # Same structure as the previous tie, with a different receipt forced
+        # onto segment 1: ids sort as (a,b,c,d); the two solutions are
+        # (0,1,0,1) and (0,1,1,0), so a and b go first to their earliest
+        # segments — the forced receipt "b" keeps index 1 and c gets 0.
+        receipts = [receipt("b", 20, [1]), receipt("a", 20, [0, 1]),
+                    receipt("d", 30, [0, 1]), receipt("c", 30, [0, 1])]
+        ids, assignment, _ = reconcile_receipts([50, 50], receipts)
+        self.assertEqual(ids, ["a", "b", "c", "d"])
+        self.assertEqual(assignment, [0, 1, 0, 1])
+
+    def test_input_order_does_not_matter(self):
+        receipts = [receipt("a", 20, [0, 1]), receipt("b", 30, [0, 1]),
+                    receipt("c", 20, [1]), receipt("d", 30, [0, 1])]
+        baseline = reconcile_receipts([50, 50], receipts)
+        for seed in range(20):
+            shuffled = receipts[:]
+            random.Random(seed).shuffle(shuffled)
+            self.assertEqual(reconcile_receipts([50, 50], shuffled), baseline)
+
+    def test_zero_cost_segments_get_no_receipts(self):
+        ids, assignment, segment_receipts = reconcile_receipts(
+            [0, 10, 0], [receipt("x", 10, [0, 1, 2])]
+        )
+        self.assertEqual((ids, assignment), (["x"], [1]))
+        self.assertEqual(segment_receipts, [[], ["x"], []])
+
+    def test_zero_trip_with_no_receipts(self):
+        self.assertEqual(reconcile_receipts([0, 0], []), ([], [], [[], []]))
+
+    def test_repeated_allowed_index_is_harmless(self):
+        _, assignment, segment_receipts = reconcile_receipts(
+            [5], [receipt("a", 5, [0, 0, 0])]
+        )
+        self.assertEqual(assignment, [0])
+        self.assertEqual(segment_receipts, [["a"]])
+
+    def test_no_attribution_when_all_receipts_forced_to_one_segment(self):
+        with self.assertRaises(ValueError):
+            reconcile_receipts(
+                [100, 100],
+                [receipt("a", 100, [0]), receipt("b", 100, [0])],
+            )
+
+    def test_no_attribution_when_total_matches_but_subset_partition_fails(self):
+        # Segment 0 can be covered (x alone totals 30), but doing so leaves
+        # segment 1 unfundable: y cannot be attributed there. A purely local,
+        # segment-by-segment pick succeeds at first and fails overall.
+        with self.assertRaises(ValueError):
+            reconcile_receipts(
+                [30, 20],
+                [receipt("x", 30, [0, 1]), receipt("y", 20, [0])],
+            )
+
+    def test_twelve_receipts_against_brute_force(self):
+        from itertools import product as iproduct
+
+        receipts = [receipt(f"r{i:02d}", 1, [0, 1]) for i in range(12)]
+        costs = [6, 6]
+        ids, assignment, segment_receipts = reconcile_receipts(costs, receipts)
+        self.assertEqual(ids, [r.id for r in receipts])
+        # lex minimum: the first six ids go to segment 0
+        self.assertEqual(assignment, [0] * 6 + [1] * 6)
+        self.assertEqual(sum(assignment), 6)
+        self.assertEqual(len(segment_receipts[0]), 6)
+        self.assertEqual(len(segment_receipts[1]), 6)
+        # and it really is the brute-force minimum
+        best = None
+        for combo in iproduct(range(2), repeat=12):
+            if sum(combo) == 6:
+                if best is None or combo < best:
+                    best = combo
+        self.assertEqual(tuple(assignment), best)
+
+    def test_random_cases_match_brute_force(self):
+        from itertools import product as iproduct
+
+        def brute(costs, receipts):
+            solutions = []
+            for combo in iproduct(range(len(costs)), repeat=len(receipts)):
+                sums = [0] * len(costs)
+                ok = True
+                for k, j in enumerate(combo):
+                    if j not in set(receipts[k].segments):
+                        ok = False
+                        break
+                    sums[j] += receipts[k].amount
+                if ok and sums == costs:
+                    solutions.append(combo)
+            if not solutions:
+                return None
+            order = sorted(range(len(receipts)), key=lambda k: receipts[k].id)
+            solutions.sort(key=lambda c: tuple(c[k] for k in order))
+            return tuple(solutions[0][k] for k in order)
+
+        rng = random.Random(20260927)
+        feasible = 0
+        for _ in range(800):
+            n_segments = rng.randint(1, 4)
+            n_receipts = rng.randint(1, 6)
+            truth = [rng.randrange(n_segments) for _ in range(n_receipts)]
+            amounts = [rng.randint(1, 5) for _ in range(n_receipts)]
+            costs = [0] * n_segments
+            for j, amount in zip(truth, amounts):
+                costs[j] += amount
+            receipts = []
+            for k in range(n_receipts):
+                allowed = [truth[k]] + [
+                    j for j in range(n_segments)
+                    if j != truth[k] and rng.random() < 0.35
+                ]
+                rng.shuffle(allowed)
+                receipts.append(receipt(f"r{k:02d}", amounts[k], allowed))
+            # built from a real attribution, so every case is feasible
+            expected = brute(costs, receipts)
+            self.assertIsNotNone(expected)
+            feasible += 1
+            ids, assignment, segment_receipts = reconcile_receipts(
+                costs, receipts
+            )
+            self.assertEqual(tuple(assignment), expected)
+            amount_by_id = {r.id: r.amount for r in receipts}
+            for j, cost in enumerate(costs):
+                self.assertEqual(
+                    sum(amount_by_id[rid] for rid in segment_receipts[j]), cost
+                )
+        self.assertGreater(feasible, 100)
 
 
 if __name__ == "__main__":

@@ -839,5 +839,277 @@ class RevisionImpactApiTests(unittest.TestCase):
             self.assertEqual(resp.json(), baseline)
 
 
+class ReceiptReconcileApiTests(unittest.TestCase):
+    PAYLOAD = {
+        "segments": [100, 251, 80],
+        "passengers": [
+            {"id": "alice", "board": 0, "alight": 3},
+            {"id": "bob", "board": 1, "alight": 3},
+            {"id": "carol", "board": 0, "alight": 1},
+        ],
+        "receipts": [
+            {"id": "R-251", "amount": 251, "segments": [1]},
+            {"id": "R-100b", "amount": 40, "segments": [0, 2]},
+            {"id": "R-80a", "amount": 40, "segments": [0, 2]},
+            {"id": "R-80b", "amount": 40, "segments": [0, 2]},
+            {"id": "R-100a", "amount": 60, "segments": [0, 2]},
+        ],
+    }
+
+    def test_reconcile_ok(self):
+        resp = client.post("/receipt-reconcile", json=self.PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["total_cost"], 431)
+        self.assertEqual(body["assignments"], [
+            {"id": "R-100a", "segment": 0},
+            {"id": "R-100b", "segment": 0},
+            {"id": "R-251", "segment": 1},
+            {"id": "R-80a", "segment": 2},
+            {"id": "R-80b", "segment": 2},
+        ])
+        self.assertEqual(body["segments"], [
+            {"index": 0, "cost": 100, "receipts": ["R-100a", "R-100b"]},
+            {"index": 1, "cost": 251, "receipts": ["R-251"]},
+            {"index": 2, "cost": 80, "receipts": ["R-80a", "R-80b"]},
+        ])
+        # totals reuse the existing /split allocation
+        split = client.post("/split", json={
+            "segments": self.PAYLOAD["segments"],
+            "passengers": self.PAYLOAD["passengers"],
+        }).json()
+        self.assertEqual(body["totals"], split["totals"])
+        self.assertEqual(body["totals"],
+                         {"alice": 216, "bob": 165, "carol": 50})
+        # every receipt attributed once; each segment's receipts total its cost
+        self.assertEqual(
+            sorted(a["id"] for a in body["assignments"]),
+            sorted(r["id"] for r in self.PAYLOAD["receipts"]),
+        )
+        amount = {r["id"]: r["amount"] for r in self.PAYLOAD["receipts"]}
+        for seg, cost in zip(body["segments"], self.PAYLOAD["segments"]):
+            self.assertEqual(sum(amount[rid] for rid in seg["receipts"]), cost)
+
+    def test_tie_break_is_lex_smallest_index_sequence(self):
+        # the four flexible receipts split 100/80 two ways; the id-sorted
+        # index sequence (0,0,1,2,2) wins over (0,2,1,0,2)-style alternatives
+        body = client.post("/receipt-reconcile", json=self.PAYLOAD).json()
+        by_id = {a["id"]: a["segment"] for a in body["assignments"]}
+        self.assertEqual(
+            [by_id[rid] for rid in sorted(by_id)],
+            [0, 0, 1, 2, 2],
+        )
+
+    def test_input_order_does_not_matter(self):
+        import random
+        baseline = client.post("/receipt-reconcile", json=self.PAYLOAD).json()
+        for seed in range(10):
+            shuffled = {
+                "segments": self.PAYLOAD["segments"],
+                "passengers": self.PAYLOAD["passengers"][:],
+                "receipts": self.PAYLOAD["receipts"][:],
+            }
+            random.Random(seed).shuffle(shuffled["receipts"])
+            random.Random(seed + 77).shuffle(shuffled["passengers"])
+            resp = client.post("/receipt-reconcile", json=shuffled)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json(), baseline)
+
+    def test_zero_cost_trip_without_receipts(self):
+        payload = {"segments": [0, 0], "passengers": [], "receipts": []}
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {
+            "total_cost": 0,
+            "assignments": [],
+            "segments": [
+                {"index": 0, "cost": 0, "receipts": []},
+                {"index": 1, "cost": 0, "receipts": []},
+            ],
+            "totals": {},
+        })
+
+    def test_zero_cost_segment_gets_no_receipts(self):
+        payload = {
+            "segments": [0, 50],
+            "passengers": [{"id": "a", "board": 1, "alight": 2}],
+            "receipts": [
+                {"id": "x", "amount": 20, "segments": [0, 1]},
+                {"id": "y", "amount": 30, "segments": [1]},
+            ],
+        }
+        body = client.post("/receipt-reconcile", json=payload).json()
+        self.assertEqual(body["segments"][0]["receipts"], [])
+        self.assertEqual(body["segments"][1]["receipts"], ["x", "y"])
+        self.assertEqual(body["totals"], {"a": 50})
+
+    def test_repeated_allowed_index_is_accepted(self):
+        payload = {
+            "segments": [5],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "receipts": [{"id": "x", "amount": 5, "segments": [0, 0]}],
+        }
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["assignments"], [{"id": "x", "segment": 0}])
+
+    def test_twelve_receipts_is_ok_thirteen_is_422(self):
+        ok = {
+            "segments": [12],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "receipts": [
+                {"id": f"r{i}", "amount": 1, "segments": [0]} for i in range(12)
+            ],
+        }
+        resp = client.post("/receipt-reconcile", json=ok)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(len(resp.json()["segments"][0]["receipts"]), 12)
+
+        too_many = dict(ok, segments=[13], receipts=ok["receipts"] + [
+            {"id": "r12", "amount": 1, "segments": [0]}
+        ])
+        self.assertEqual(
+            client.post("/receipt-reconcile", json=too_many).status_code, 422
+        )
+
+    def test_total_mismatch_is_422(self):
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "receipts": [{"id": "x", "amount": 99, "segments": [0]}],
+        }
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("receipts total", resp.text)
+
+    def test_illegal_segment_index_is_422(self):
+        for index in (3, -1):
+            payload = {
+                "segments": [10, 10, 10],
+                "passengers": [{"id": "a", "board": 0, "alight": 3}],
+                "receipts": [{"id": "x", "amount": 30, "segments": [index]}],
+            }
+            resp = client.post("/receipt-reconcile", json=payload)
+            self.assertEqual(resp.status_code, 422, index)
+        resp = client.post("/receipt-reconcile", json={
+            "segments": [10, 10, 10],
+            "passengers": [{"id": "a", "board": 0, "alight": 3}],
+            "receipts": [{"id": "x", "amount": 30, "segments": [3]}],
+        })
+        self.assertIn("out of range", resp.text)
+
+    def test_duplicate_receipt_id_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "receipts": [
+                {"id": "x", "amount": 5, "segments": [0]},
+                {"id": "x", "amount": 5, "segments": [0]},
+            ],
+        }
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("duplicate receipt id", resp.text)
+
+    def test_empty_receipt_id_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "receipts": [{"id": "", "amount": 10, "segments": [0]}],
+        }
+        self.assertEqual(
+            client.post("/receipt-reconcile", json=payload).status_code, 422
+        )
+
+    def test_non_positive_or_non_integer_amount_is_422(self):
+        base = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+        }
+        for amount in (0, -1, 2.5):
+            payload = dict(base, receipts=[
+                {"id": "x", "amount": amount, "segments": [0]}
+            ])
+            self.assertEqual(
+                client.post("/receipt-reconcile", json=payload).status_code,
+                422, amount,
+            )
+
+    def test_empty_segments_list_on_receipt_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+            "receipts": [{"id": "x", "amount": 10, "segments": []}],
+        }
+        self.assertEqual(
+            client.post("/receipt-reconcile", json=payload).status_code, 422
+        )
+
+    def test_missing_receipts_field_is_422(self):
+        payload = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+        }
+        self.assertEqual(
+            client.post("/receipt-reconcile", json=payload).status_code, 422
+        )
+
+    def test_unreconcilable_receipts_are_422(self):
+        # totals match, but both receipts can only cover segment 0; segment
+        # 1's 100 cents cannot be formed.
+        payload = {
+            "segments": [100, 100],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+            "receipts": [
+                {"id": "x", "amount": 100, "segments": [0]},
+                {"id": "y", "amount": 100, "segments": [0]},
+            ],
+        }
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("cannot be reconciled", resp.text)
+
+    def test_unreconcilable_despite_greedy_match_is_422(self):
+        # segment 0 CAN be covered (x alone totals 30), yet that leaves
+        # segment 1 impossible: y may never be attributed to it.
+        payload = {
+            "segments": [30, 20],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+            "receipts": [
+                {"id": "x", "amount": 30, "segments": [0, 1]},
+                {"id": "y", "amount": 20, "segments": [0]},
+            ],
+        }
+        self.assertEqual(
+            client.post("/receipt-reconcile", json=payload).status_code, 422
+        )
+
+    def test_split_trip_rules_still_apply(self):
+        payload = {
+            "segments": [100],
+            "passengers": [{"id": "a", "board": 0, "alight": 0}],
+            "receipts": [{"id": "x", "amount": 100, "segments": [0]}],
+        }
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("invalid interval", resp.text)
+
+        # empty-load charged segment
+        payload = {
+            "segments": [10, 0],
+            "passengers": [{"id": "a", "board": 1, "alight": 2}],
+            "receipts": [{"id": "x", "amount": 10, "segments": [1]}],
+        }
+        resp = client.post("/receipt-reconcile", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+    def test_unknown_field_is_422(self):
+        payload = dict(self.PAYLOAD, currency="usd")
+        self.assertEqual(
+            client.post("/receipt-reconcile", json=payload).status_code, 422
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

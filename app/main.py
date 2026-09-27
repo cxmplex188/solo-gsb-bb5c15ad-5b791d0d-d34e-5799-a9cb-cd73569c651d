@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from .models import (
     AdmitRequest,
@@ -10,9 +10,13 @@ from .models import (
     FareEnvelopeRequest,
     FareEnvelopeResponse,
     FareEnvelopeWitness,
+    ReceiptAssignment,
+    ReceiptReconcileRequest,
+    ReceiptReconcileResponse,
     RevisionImpactRequest,
     RevisionImpactResponse,
     SegmentContribution,
+    SegmentReceipts,
     SegmentSplit,
     SettleRequest,
     SettleResponse,
@@ -23,6 +27,7 @@ from .models import (
 from .splitter import (
     admit_passengers,
     fare_envelope as compute_fare_envelope,
+    reconcile_receipts,
     revision_impact as compute_revision_impact,
     settle_balances,
     split_fares,
@@ -30,7 +35,7 @@ from .splitter import (
 
 app = FastAPI(
     title="Carpool Fare Splitter",
-    version="1.1.0",
+    version="1.2.0",
     summary="Split a carpool trip's per-segment costs fairly between passengers.",
 )
 
@@ -181,4 +186,39 @@ def revision_impact(request: RevisionImpactRequest) -> RevisionImpactResponse:
             )
             for c in changes
         ],
+    )
+
+
+@app.post(
+    "/receipt-reconcile",
+    response_model=ReceiptReconcileResponse,
+    responses={422: {"description": "Invalid trip or reconciliation (bad "
+                                     "interval, out-of-range station, duplicate "
+                                     "id, empty-load charged segment, more than "
+                                     "12 receipts, duplicate/empty receipt id, "
+                                     "out-of-range or empty receipt segment "
+                                     "list, non-positive or non-integer amount, "
+                                     "receipt totals that do not match the trip "
+                                     "cost, or no exact per-segment attribution "
+                                     "exists, ...)"}},
+)
+def receipt_reconcile(request: ReceiptReconcileRequest) -> ReceiptReconcileResponse:
+    try:
+        ordered_ids, assignment, segment_receipts = reconcile_receipts(
+            request.segments, request.receipts
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    totals, _ = split_fares(request.segments, request.passengers)
+    return ReceiptReconcileResponse(
+        total_cost=sum(request.segments),
+        assignments=[
+            ReceiptAssignment(id=rid, segment=assignment[k])
+            for k, rid in enumerate(ordered_ids)
+        ],
+        segments=[
+            SegmentReceipts(index=j, cost=cost, receipts=segment_receipts[j])
+            for j, cost in enumerate(request.segments)
+        ],
+        totals={str(pid): amount for pid, amount in totals.items()},
     )
